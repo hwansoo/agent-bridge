@@ -49,3 +49,19 @@ test("다른 폴더 스레드는 무시하고, 핀이 있으면 핀을 따른다
   assert.deepEqual(await pickThread(fake(threads), CWD, "other"), { id: "other", busy: false });
   assert.deepEqual(await pickThread(fake([]), CWD), { busy: false });
 });
+
+test("이 서버 시작 시각과 생성 시각이 맞는 스레드(새로 연 빈 창)를 대화 내용 있는 옛 스레드보다 우선한다", async () => {
+  const start = 1_794_900_965_000;
+  const threads = [
+    { id: "old-with-history", cwd: CWD, status: { type: "idle" }, createdAt: 1_794_900_142, updatedAt: 1_794_900_667, preview: "resume" },
+    { id: "new-empty", cwd: CWD, status: { type: "idle" }, createdAt: 1_794_900_965, updatedAt: 1_794_900_965, preview: "" },
+  ];
+  assert.deepEqual(await pickThread(fake(threads), CWD, undefined, start), { id: "new-empty", busy: false });
+  // 옛 스레드의 서버 입장에서는 옛 스레드
+  assert.deepEqual(await pickThread(fake(threads), CWD, undefined, 1_794_900_142_400), { id: "old-with-history", busy: false });
+  // 짝 스레드가 작업 중이면 기다림
+  threads[1].status = { type: "active" };
+  assert.deepEqual(await pickThread(fake(threads), CWD, undefined, start), { busy: true });
+  // 짝이 없으면(재개한 오래된 스레드) 대화 내용 있는 최근 스레드
+  assert.deepEqual(await pickThread(fake(threads), CWD, undefined, start + 3_600_000), { id: "old-with-history", busy: false });
+});

@@ -22,11 +22,28 @@ interface Thr {
   cwd?: string;
   status?: { type: string };
   updatedAt?: number;
+  recencyAt?: number;
+  createdAt?: number; // 초 단위
   preview?: string;
 }
 
-/** 같은 폴더에 로드된 스레드 중 유휴인 것(없으면 undefined). MSGR_CODEX_THREAD로 고정 가능. */
-export async function pickThread(rpc: CodexRpc, cwd: string, pin?: string): Promise<{ id?: string; busy: boolean }> {
+/** 이 MCP 서버 프로세스가 시작된 시각(ms) */
+const STARTED_AT = Date.now() - process.uptime() * 1000;
+/** 스레드 생성 시각과 서버 시작 시각이 이 안이면 "이 서버의 스레드"로 본다(Codex는 스레드마다 MCP 서버를 띄운다) */
+const PAIR_WINDOW_MS = 30_000;
+
+/**
+ * 주입할 스레드를 고른다. MSGR_CODEX_THREAD/핀으로 고정 가능.
+ *  1) 같은 폴더 스레드 중 생성 시각이 이 서버 시작 시각과 가장 가까운(30초 이내) 스레드 = 이 서버의 스레드
+ *  2) 없으면(오래된 스레드를 재개한 경우 등) 대화 내용이 있는 것 우선, 그중 가장 최근 활동한 스레드
+ * 고른 스레드가 작업 중이면 다른 스레드로 넘기지 않고 기다린다.
+ */
+export async function pickThread(
+  rpc: CodexRpc,
+  cwd: string,
+  pin?: string,
+  startedAt = STARTED_AT,
+): Promise<{ id?: string; busy: boolean }> {
   const fixed = pin ?? process.env.MSGR_CODEX_THREAD;
   const loaded = (await rpc.request("thread/loaded/list", {})).data as string[];
   const mine: Thr[] = [];
@@ -35,11 +52,11 @@ export async function pickThread(rpc: CodexRpc, cwd: string, pin?: string): Prom
     const t = (await rpc.request("thread/read", { threadId: id, includeTurns: false })).thread as Thr;
     if (fixed ? true : t.cwd && real(t.cwd) === real(cwd)) mine.push(t);
   }
-  // 대상은 "사용자가 지금 쓰고 있는" 스레드 하나: 대화 내용이 있는 것 우선, 그중 가장 최근 갱신된 것.
-  // 그 스레드가 작업 중이면 다른 유휴 스레드(재시작 때 생긴 빈 스레드 등 화면에 없는 것)로 넘기지 않고 기다린다.
-  const best = mine.sort(
-    (a, b) => Number(!!b.preview) - Number(!!a.preview) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
-  )[0];
+  const gap = (t: Thr) => (t.createdAt ? Math.abs(t.createdAt * 1000 - startedAt) : Infinity);
+  const paired = mine.filter((t) => gap(t) <= PAIR_WINDOW_MS).sort((a, b) => gap(a) - gap(b))[0];
+  const recency = (t: Thr) => t.recencyAt ?? t.updatedAt ?? 0;
+  const best =
+    paired ?? mine.sort((a, b) => Number(!!b.preview) - Number(!!a.preview) || recency(b) - recency(a))[0];
   if (!best) return { busy: false };
   return best.status?.type === "idle" ? { id: best.id, busy: false } : { busy: true };
 }

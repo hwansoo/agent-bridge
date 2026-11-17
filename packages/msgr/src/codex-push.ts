@@ -35,11 +35,13 @@ export async function pickThread(rpc: CodexRpc, cwd: string, pin?: string): Prom
     const t = (await rpc.request("thread/read", { threadId: id, includeTurns: false })).thread as Thr;
     if (fixed ? true : t.cwd && real(t.cwd) === real(cwd)) mine.push(t);
   }
-  // 대화 내용이 있는 스레드를 우선하고(빈 스레드는 후순위), 그 안에서 가장 최근 갱신된 유휴 스레드를 고른다
-  const idle = mine
-    .filter((t) => t.status?.type === "idle")
-    .sort((a, b) => Number(!!b.preview) - Number(!!a.preview) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-  return idle.length ? { id: idle[0].id, busy: false } : { busy: mine.length > 0 };
+  // 대상은 "사용자가 지금 쓰고 있는" 스레드 하나: 대화 내용이 있는 것 우선, 그중 가장 최근 갱신된 것.
+  // 그 스레드가 작업 중이면 다른 유휴 스레드(재시작 때 생긴 빈 스레드 등 화면에 없는 것)로 넘기지 않고 기다린다.
+  const best = mine.sort(
+    (a, b) => Number(!!b.preview) - Number(!!a.preview) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+  )[0];
+  if (!best) return { busy: false };
+  return best.status?.type === "idle" ? { id: best.id, busy: false } : { busy: true };
 }
 
 export function startCodexPush(getMe: () => Agent | undefined, log: (m: string) => void = () => {}) {

@@ -1,0 +1,40 @@
+{
+  "name": "agent-msgr",
+  "version": "0.1.0",
+  "description": "Message passing between coding-agent sessions (Claude Code, OpenCode, Codex, agy)",
+  "scripts": {
+    "build": "esbuild src/server.ts src/cli.ts --bundle --platform=node --format=esm --target=node22 --outdir=dist --banner:js=\"import{createRequire}from\\\"module\\\";const require=createRequire(import.meta.url);\"",
+    "typecheck": "tsc --noEmit --module nodenext --target es2022 --strict --skipLibCheck --types node src/*.ts",
+    "test": "npm run build && node test/smoke.mjs",
+    "test:unit": "node --test test/ratelimit.test.mjs",
+    "setup": "node dist/cli.js setup"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "opencode",
+    "codex",
+    "agents"
+  ],
+  "author": "hwansoo",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "bin": {
+    "msgr": "dist/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hwansoo/agent-bridge.git",
+    "directory": "packages/msgr"
+  },
+  "private": true
+}

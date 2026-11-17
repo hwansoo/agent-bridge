@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.msgr/
+*.bak-msgr*
+.DS_Store

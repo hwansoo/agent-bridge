@@ -117,3 +117,48 @@ test("부분 커밋: commit(k)는 앞의 k건만 소비한다", async () => {
   p.commit(1);
   assert.deepEqual(s.readInbox("t").map((m) => m.body), ["m2", "m3"]);
 });
+
+test("재리뷰 1. 커서가 생긴 뒤에도 등록 전 브로드캐스트는 받지 않는다", async () => {
+  const { s } = await fresh();
+  s.send("x", "t", "old-direct-1");
+  s.send("x", "*", "old-broadcast");
+  s.send("x", "t", "old-direct-2");
+  reg(s, "t");
+  const p = s.pollInbox("t");
+  assert.deepEqual(p.msgs.map((m) => m.body), ["old-direct-1", "old-direct-2"]);
+  p.commit(1);
+  assert.deepEqual(s.readInbox("t").map((m) => m.body), ["old-direct-2"]);
+});
+
+test("재리뷰 2. gc가 로그를 비운 뒤 같은 id로 재등록해도 새 브로드캐스트를 받는다", async () => {
+  const { s, home } = await fresh();
+  const big = "z".repeat(30 * 1024);
+  for (let i = 0; i < 40; i++) s.send("o", "someone", big); // 1MB 이상
+  reg(s, "t");
+  const f = path.join(home, "agents", "t.json");
+  const a = JSON.parse(fs.readFileSync(f, "utf8"));
+  fs.writeFileSync(f, JSON.stringify({ ...a, ts: Date.now() - 5 * 60_000 })); // 오프라인(24시간 미만)
+  assert.match(s.gc(false).join("\n"), /메시지 로그 비움/);
+  assert.ok(Date.now() - JSON.parse(fs.readFileSync(f, "utf8")).ts > 4 * 60_000, "gc가 하트비트 시각을 바꾸지 않음");
+  reg(s, "t");
+  s.send("x", "*", "new-after-gc");
+  assert.deepEqual(s.readInbox("t").map((m) => m.body), ["new-after-gc"]);
+});
+
+test("재리뷰 3. 만료로 잠금을 빼앗긴 이전 소유자의 release가 새 소유자의 잠금을 지우지 않는다", async () => {
+  const { s, home } = await fresh();
+  reg(s, "t");
+  s.send("x", "t", "lock-test");
+  const first = s.pollInbox("t");
+  assert.equal(first.msgs.length, 1);
+  const lf = path.join(home, "locks", "t.lock");
+  const old = new Date(Date.now() - 11 * 60_000);
+  fs.utimesSync(lf, old, old); // 만료 시뮬레이션
+  const second = s.pollInbox("t");
+  assert.equal(second.msgs.length, 1, "만료된 잠금은 회수");
+  first.release();
+  const third = s.pollInbox("t");
+  assert.equal(third.msgs.length, 0, "새 소유자의 잠금이 유지되어 중복 없음");
+  second.commit();
+  assert.deepEqual(s.readInbox("t"), []);
+});

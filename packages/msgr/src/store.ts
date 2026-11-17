@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 export const ROOT = process.env.MSGR_HOME ?? path.join(os.homedir(), ".msgr");
 const LOG = path.join(ROOT, "messages.jsonl");
@@ -251,6 +251,12 @@ export function gc(dryRun = false): string[] {
     if (!dryRun) {
       fs.truncateSync(LOG, 0);
       for (const f of fs.readdirSync(CURSORS)) fs.rmSync(path.join(CURSORS, f), { force: true });
+      // 등록 시점(since)은 옛 로그의 오프셋이므로 새 로그 기준(0)으로 되돌린다
+      for (const a of agents) {
+        if (!a.since) continue;
+        const { online, ...rest } = a; // ts(마지막 하트비트)는 그대로 둔다
+        fs.writeFileSync(agentFile(a.id), JSON.stringify({ ...rest, since: 0 }));
+      }
     }
   } else if (size > 1024 * 1024) {
     report.push(`메시지 로그가 ${(size / 1024).toFixed(0)}KB입니다. 온라인 에이전트(${online})가 있어 비우지 않았습니다.`);
@@ -324,7 +330,9 @@ export function checkSendAllowed(
 }
 
 const CHUNK = 4 * 1024 * 1024; // 한 번에 읽는 최대 크기
-const LOCK_STALE_MS = 2 * 60_000; // 소비 잠금이 이보다 오래되면(프로세스 죽음 등) 무시
+// 소비 잠금 만료: 주인 프로세스가 죽었으면 즉시, 살아 있어도 이보다 오래 잡고 있으면 회수한다.
+// push의 외부 API 호출 시간(최대 수십 초)보다 충분히 길게 둔다.
+const LOCK_STALE_MS = 10 * 60_000;
 
 function readCursor(cur: string): number | undefined {
   try {
@@ -340,14 +348,18 @@ function lock(id: string): (() => void) | undefined {
   const f = path.join(LOCKS, safe(id) + ".lock");
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
+      const token = `${process.pid} ${randomBytes(8).toString("hex")}`;
       const fd = fs.openSync(f, "wx", 0o600);
-      fs.writeSync(fd, String(process.pid));
+      fs.writeSync(fd, token);
       fs.closeSync(fd);
       let released = false;
       return () => {
         if (released) return;
         released = true;
-        fs.rmSync(f, { force: true });
+        // 만료로 빼앗긴 뒤라면 새 주인의 잠금이므로 지우지 않는다
+        try {
+          if (fs.readFileSync(f, "utf8") === token) fs.rmSync(f, { force: true });
+        } catch {}
       };
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
@@ -355,7 +367,7 @@ function lock(id: string): (() => void) | undefined {
       let stale = false;
       try {
         const st = fs.statSync(f);
-        const pid = Number(fs.readFileSync(f, "utf8"));
+        const pid = Number(fs.readFileSync(f, "utf8").split(" ")[0]);
         stale = Date.now() - st.mtimeMs > LOCK_STALE_MS;
         if (!stale && pid) {
           try {
@@ -403,10 +415,14 @@ export function pollInbox(id: string): Poll {
     const cur = path.join(CURSORS, safe(id));
     const saved = readCursor(cur);
     const size = fs.statSync(LOG).size;
-    // 첫 읽기(커서 없음): 과거 직접 메시지는 받고, 브로드캐스트는 등록 이후(since) 것만 받는다
-    const since = saved === undefined ? (getAgent(id)?.since ?? size) : 0;
     // 로그가 비워졌는데 커서가 남아 있으면(수동 정리 등) 처음부터 다시 읽는다
-    let off = saved !== undefined && saved > size ? 0 : (saved ?? 0);
+    const reset = saved !== undefined && saved > size;
+    let off = reset || saved === undefined ? 0 : saved;
+    // 과거 직접 메시지는 받고, 브로드캐스트는 등록 이후(since) 것만 받는다(커서 유무와 무관).
+    // 등록 기록이 없으면: 첫 읽기는 지금 이후, 이어 읽기는 전부. 로그가 비워졌으면 위치 기준이 무의미하므로 0.
+    const recorded = getAgent(id)?.since;
+    let since = recorded ?? (saved === undefined ? size : 0);
+    if (reset || since > size) since = 0;
     const fd = fs.openSync(LOG, "r");
     try {
       while (off < size) {

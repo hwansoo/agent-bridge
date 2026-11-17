@@ -28,7 +28,7 @@ function oc(args: string[], cwd: string): Promise<string> {
 
 interface Sess {
   id: string;
-  time: { updated: number; viewed?: number };
+  time: { updated: number; viewed?: number; archived?: number };
   location?: { directory?: string };
 }
 
@@ -37,7 +37,8 @@ export async function pickSession(cwd: string, pin?: string): Promise<string | u
   const fixed = pin ?? process.env.MSGR_OC_SESSION;
   if (fixed) return fixed;
   const list = (JSON.parse(await oc(["GET", "/api/session"], cwd)).data as Sess[]).filter(
-    (s) => s.location?.directory === cwd,
+    // 보관된 세션(위임 스킬의 opencode run --archived 등)은 화면에 없으므로 제외
+    (s) => s.location?.directory === cwd && !s.time.archived,
   );
   if (!list.length) return undefined;
   const active = JSON.parse(await oc(["GET", "/api/session/active"], cwd)).data ?? {};

@@ -109,15 +109,17 @@ node dist/cli.js watch [--once] [--tool t]       # 새 메시지 출력. 기본�
 - `~/.msgr/audit.log`에 "누가 어떤 경로로 몇 건을 소비했는지"가 기록됩니다(`via=hook:agy`, `watch-once`, `mcp-read_inbox`, `cli-inbox`). 자동 수신이 어떤 경로로 동작했는지 확인할 때 보세요. 512KB를 넘으면 `audit.log.1`로 한 세대만 보관하고 새로 시작합니다.
 - `node dist/cli.js gc`는 등록이 사라진 에이전트의 커서·핀·watcher 기록을 지우고, 온라인 에이전트가 없을 때만 1MB가 넘는 메시지 로그를 비웁니다. 먼저 `--dry-run`으로 확인하세요.
 - 레지스트리 항목은 하트비트가 3분 끊기면 offline으로 표시되고, 24시간 뒤 자동 삭제됩니다.
+- 한 세션의 메시지를 여러 경로(자동 주입, 훅, watch, `read_inbox`)가 동시에 가져가지 않도록 `~/.msgr/locks/`에 에이전트별 소비 잠금을 둡니다. 잠금은 주인 프로세스가 죽었거나 2분이 지나면 무시됩니다.
+- `setup`은 msgr 항목만 고치고 같은 그룹의 다른 훅은 그대로 둡니다. 설정 파일 JSON이 깨져 있으면 그 파일은 건드리지 않고 실패로 보고합니다. 백업은 `*.bak-msgr`(msgr 설치 전 원본)과 `*.bak-msgr-last`(마지막 실행 직전)입니다.
 
 ## 테스트
 
 ```sh
-npm test           # 빌드 후 test/smoke.mjs 실행(25개 항목)
-npm run test:unit  # RateWindow / Backoff 단위 테스트
+npm test           # 빌드 후 test/smoke.mjs 실행(28개 항목)
+npm run test:unit  # RateWindow / Backoff / store(커서·잠금·브로드캐스트·속도 제한·gc) 단위 테스트
 ```
 
-임시 `MSGR_HOME`과 가짜 MCP 클라이언트(claude-code, opencode, codex, agy)로 id 생성, 지칭과 모호성 오류, 별칭, 한 번만 읽기, 루프 방지, 훅 출력 형식(Codex 평문/agy JSON), `watch --once`, 핀, `setup` 안전장치, `gc`, `audit` 로테이션, 깨진 로그 줄 건너뛰기, 크기 제한, 세션 재개 시 재주입 없음, 저장소 권한을 검증합니다. 실제 `~/.msgr`와 에이전트 설정은 건드리지 않습니다. 실제 OpenCode/Codex 서버에 대한 자동 주입은 각 도구가 떠 있어야 하므로 이 테스트에 포함되지 않습니다.
+임시 `MSGR_HOME`과 가짜 MCP 클라이언트(claude-code, opencode, codex, agy)로 id 생성, 지칭과 모호성 오류, 별칭, 한 번만 읽기, 루프 방지, 훅 출력 형식(Codex 평문/agy JSON), `watch --once`, 핀, `setup` 안전장치, `gc`, `audit` 로테이션, 깨진 로그 줄 건너뛰기, 크기 제한, 세션 재개 시 재주입 없음, 저장소 권한, `setup`의 사용자 훅 보존과 깨진 설정 파일 보호를 검증합니다. 실제 `~/.msgr`와 에이전트 설정은 건드리지 않습니다. 실제 OpenCode/Codex 서버에 대한 자동 주입은 각 도구가 떠 있어야 하므로 이 테스트에 포함되지 않습니다.
 
 ## 알려진 한계
 

@@ -9,8 +9,9 @@ const CURSORS = path.join(ROOT, "cursors");
 const AGENTS = path.join(ROOT, "agents");
 const PINS = path.join(ROOT, "pins");
 const WATCHERS = path.join(ROOT, "watchers");
+const LOCKS = path.join(ROOT, "locks");
 // 메시지 본문이 다른 로컬 사용자에게 보이지 않도록 저장소 전체를 소유자 전용(0700)으로 둔다
-for (const d of [ROOT, CURSORS, AGENTS, PINS, WATCHERS]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+for (const d of [ROOT, CURSORS, AGENTS, PINS, WATCHERS, LOCKS]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
 try {
   fs.chmodSync(ROOT, 0o700); // 이전 버전이 755로 만든 경우도 바로잡는다
 } catch {}
@@ -43,6 +44,7 @@ export interface Agent {
   alias?: string;
   client?: string; // 클라이언트가 핸드셰이크에서 보고한 원래 이름
   ts: number; // 마지막 하트비트
+  since?: number; // 처음 등록될 때의 로그 크기: 이후의 브로드캐스트는 첫 읽기에서도 받는다
   online?: boolean;
 }
 
@@ -57,8 +59,10 @@ export function makeId(tool: string, cwd: string, sessionId?: string): { id: str
   return { id: `${tool}:${folder}#${short}`, folder };
 }
 
-export function register(a: Omit<Agent, "ts" | "online">): Agent {
-  const full: Agent = { ...a, ts: Date.now() };
+export function register(a: Omit<Agent, "ts" | "online" | "since">): Agent {
+  // 같은 id로 재등록(세션 재개)이면 처음 구독 위치를 유지한다
+  const since = getAgent(a.id)?.since ?? fs.statSync(LOG).size;
+  const full: Agent = { ...a, since, ts: Date.now() };
   fs.writeFileSync(agentFile(a.id), JSON.stringify(full));
   return full;
 }
@@ -82,23 +86,30 @@ export function unregister(id: string) {
   for (const f of [agentFile(id), path.join(WATCHERS, safe(id) + ".pid"), path.join(WATCHERS, safe(id) + ".nudge")]) fs.rmSync(f, { force: true });
 }
 
-export function listAgents(maxAgeMs = 3 * 60_000): Agent[] {
-  const out: Agent[] = [];
+const STALE_MS = 24 * 3600_000;
+
+/** 레지스트리 파일 중 유효한 것과 정리 대상(손상·하루 넘게 하트비트 없음)을 나눈다. 아무것도 지우지 않는다. */
+function scanAgents(maxAgeMs: number): { agents: Agent[]; stale: string[] } {
+  const agents: Agent[] = [];
+  const stale: string[] = [];
   for (const f of fs.readdirSync(AGENTS)) {
     const file = path.join(AGENTS, f);
     try {
       const a = JSON.parse(fs.readFileSync(file, "utf8")) as Agent;
-      // 구버전/손상 항목, 하루 넘게 하트비트 없는 잔재는 정리한다
-      if (!a.id || Date.now() - a.ts > 24 * 3600_000) {
-        fs.rmSync(file, { force: true });
-        continue;
-      }
-      out.push({ ...a, online: Date.now() - a.ts < maxAgeMs });
+      if (!a.id || typeof a.ts !== "number" || Date.now() - a.ts > STALE_MS) stale.push(file);
+      else agents.push({ ...a, online: Date.now() - a.ts < maxAgeMs });
     } catch {
-      fs.rmSync(file, { force: true });
+      stale.push(file);
     }
   }
-  return out;
+  return { agents, stale };
+}
+
+export function listAgents(maxAgeMs = 3 * 60_000, prune = true): Agent[] {
+  const { agents, stale } = scanAgents(maxAgeMs);
+  // 구버전/손상 항목, 하루 넘게 하트비트 없는 잔재는 정리한다
+  if (prune) for (const f of stale) fs.rmSync(f, { force: true });
+  return agents;
 }
 
 /** 호출한 쪽이 쓴 임의의 표현(id/별칭/폴더/도구/경로 일부)을 에이전트 하나로 해석한다. */
@@ -218,12 +229,14 @@ export function audit(id: string, via: string, n: number) {
  */
 export function gc(dryRun = false): string[] {
   const report: string[] = [];
-  const agents = listAgents(); // 하루 넘은 레지스트리 항목은 여기서 이미 정리됨
+  const { agents, stale } = scanAgents(3 * 60_000);
   const known = new Set(agents.map((a) => safe(a.id)));
   const rm = (f: string, why: string) => {
     report.push(`${dryRun ? "(dry-run) " : ""}삭제: ${path.relative(ROOT, f)} — ${why}`);
     if (!dryRun) fs.rmSync(f, { force: true });
   };
+  for (const f of stale) rm(f, "손상되었거나 24시간 넘게 하트비트 없음");
+  for (const f of fs.readdirSync(LOCKS)) if (!known.has(f.replace(/\.lock$/, ""))) rm(path.join(LOCKS, f), "등록이 없는 에이전트");
   for (const [dir, suffix] of [[CURSORS, ""], [PINS, ""], [WATCHERS, ".pid"], [WATCHERS, ".nudge"]] as const) {
     for (const f of fs.readdirSync(dir)) {
       if (suffix && !f.endsWith(suffix)) continue;
@@ -257,24 +270,32 @@ export function send(from: string, to: string, body: string, thread?: string): M
   return m;
 }
 
-/** 로그 끝부분(최근 256KB)의 메시지들. 속도 제한 계산용. */
+/**
+ * 최근 sinceMs 안의 메시지들(속도 제한 계산용). 로그 끝에서부터 읽는 범위를 두 배씩 늘려
+ * 구간 맨 앞 메시지가 기준 시각보다 오래될 때까지(최대 32MB) 읽는다. 메시지 크기와 무관하게 시간 기준으로 센다.
+ */
 function recentMessages(sinceMs: number): Message[] {
   const size = fs.statSync(LOG).size;
-  const len = Math.min(size, 256 * 1024);
-  const buf = Buffer.alloc(len);
-  const fd = fs.openSync(LOG, "r");
-  fs.readSync(fd, buf, 0, len, size - len);
-  fs.closeSync(fd);
   const cutoff = Date.now() - sinceMs;
-  const out: Message[] = [];
-  for (const l of buf.toString("utf8").split("\n").slice(size > len ? 1 : 0)) {
-    if (!l) continue;
-    try {
-      const m = JSON.parse(l) as Message;
-      if (Date.parse(m.ts) >= cutoff) out.push(m);
-    } catch {}
+  const fd = fs.openSync(LOG, "r");
+  try {
+    for (let len = Math.min(size, 256 * 1024); ; len = Math.min(size, len * 2)) {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      const lines = buf.toString("utf8").split("\n").slice(size > len ? 1 : 0); // 잘린 첫 줄 제외
+      const msgs: Message[] = [];
+      for (const l of lines) {
+        if (!l) continue;
+        try {
+          msgs.push(JSON.parse(l) as Message);
+        } catch {}
+      }
+      const oldest = msgs.length ? Date.parse(msgs[0].ts) : 0;
+      if (len >= size || oldest < cutoff || len >= 32 * 1024 * 1024) return msgs.filter((m) => Date.parse(m.ts) >= cutoff);
+    }
+  } finally {
+    fs.closeSync(fd);
   }
-  return out;
 }
 
 /**
@@ -303,6 +324,7 @@ export function checkSendAllowed(
 }
 
 const CHUNK = 4 * 1024 * 1024; // 한 번에 읽는 최대 크기
+const LOCK_STALE_MS = 2 * 60_000; // 소비 잠금이 이보다 오래되면(프로세스 죽음 등) 무시
 
 function readCursor(cur: string): number | undefined {
   try {
@@ -313,64 +335,148 @@ function readCursor(cur: string): number | undefined {
   }
 }
 
-/**
- * 바이트 오프셋 커서로 새 메시지를 훑는다. commit()을 호출해야 커서가 전진한다.
- * commit(k)는 앞의 k건까지만 소비한 것으로 기록한다(나머지는 다음에 다시 나온다).
- * 커서는 앞으로만 움직인다(여러 소비자가 동시에 커밋해도 뒤로 돌아가 중복 전달되지 않게).
- */
-export function pollInbox(id: string): { msgs: Message[]; commit: (k?: number) => void } {
-  const cur = path.join(CURSORS, safe(id));
-  const saved = readCursor(cur);
-  // 첫 구독: 처음부터 읽되, 과거 브로드캐스트는 소음이라 직접 메시지만 받는다
-  const first = saved === undefined;
-  const size = fs.statSync(LOG).size;
-  // 로그가 비워졌는데 커서가 남아 있으면(수동 정리 등) 처음부터 다시 읽는다
-  const off = saved !== undefined && saved > size ? 0 : (saved ?? 0);
-  if (size <= off) return { msgs: [], commit() {} };
-  const len = Math.min(size - off, CHUNK);
-  const fd = fs.openSync(LOG, "r");
-  const buf = Buffer.alloc(len);
-  fs.readSync(fd, buf, 0, len, off);
-  fs.closeSync(fd);
-  // 마지막 줄이 미완성일 수 있으니 개행까지만 소비. 한 줄이 CHUNK보다 크면(비정상) 건너뛴다.
-  let end = buf.lastIndexOf(10) + 1;
-  if (end === 0 && len === CHUNK) end = len;
-  const msgs: Message[] = [];
-  const ends: number[] = [];
-  let pos = 0;
-  while (pos < end) {
-    const nl = buf.indexOf(10, pos);
-    const stop = nl < 0 || nl >= end ? end : nl + 1;
-    const line = buf.subarray(pos, stop).toString("utf8").trim();
-    pos = stop;
-    if (!line) continue;
-    let m: Message;
+/** 에이전트별 소비 잠금. 한 소비자(push/훅/watch/read_inbox)가 읽고 커밋할 때까지 다른 소비자는 같은 메시지를 못 가져간다. */
+function lock(id: string): (() => void) | undefined {
+  const f = path.join(LOCKS, safe(id) + ".lock");
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      m = JSON.parse(line);
-    } catch {
-      continue; // 깨진 줄(동시 기록 충돌, 디스크 풀 등)은 건너뛴다
-    }
-    if (!m || typeof m.body !== "string") continue;
-    if (m.from !== id && (m.to === id || (!first && m.to === "*"))) {
-      msgs.push(m);
-      ends.push(pos);
+      const fd = fs.openSync(f, "wx", 0o600);
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        fs.rmSync(f, { force: true });
+      };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      // 주인이 죽었거나 너무 오래 잡고 있으면 빼앗는다
+      let stale = false;
+      try {
+        const st = fs.statSync(f);
+        const pid = Number(fs.readFileSync(f, "utf8"));
+        stale = Date.now() - st.mtimeMs > LOCK_STALE_MS;
+        if (!stale && pid) {
+          try {
+            process.kill(pid, 0);
+          } catch (err) {
+            stale = (err as NodeJS.ErrnoException).code === "ESRCH";
+          }
+        }
+      } catch {
+        stale = true; // 그 사이 풀림
+      }
+      if (!stale) return undefined;
+      fs.rmSync(f, { force: true });
     }
   }
-  const commit = (k = msgs.length) => {
-    const target = off + (k >= msgs.length ? end : ends[k - 1] ?? 0);
-    if (k <= 0 && msgs.length) return;
-    const now = readCursor(cur);
-    if (now !== undefined && now > target && now <= size) return; // 다른 소비자가 이미 더 읽음
-    fs.writeFileSync(cur, String(target), { mode: 0o600 });
-  };
-  return { msgs, commit };
+  return undefined;
+}
+
+function advance(cur: string, target: number, size: number) {
+  const now = readCursor(cur);
+  if (now !== undefined && now >= target && now <= size) return; // 커서는 앞으로만
+  fs.writeFileSync(cur, String(target), { mode: 0o600 });
+}
+
+export interface Poll {
+  msgs: Message[];
+  /** 앞의 k건(기본 전부)까지 소비한 것으로 기록하고 잠금을 푼다 */
+  commit: (k?: number) => void;
+  /** 커밋 없이 잠금만 푼다(전달 실패 시) */
+  release: () => void;
+}
+
+/**
+ * 바이트 오프셋 커서로 새 메시지를 훑는다. 메시지가 있으면 소비 잠금을 잡은 채로 돌려주므로
+ * 호출자는 반드시 commit() 또는 release()를 불러야 한다(잠금은 2분 뒤 자동 만료).
+ * 다른 소비자가 잠금을 잡고 있으면 빈 결과를 돌려준다(그쪽이 전달한다).
+ * 내 메시지가 없는 구간은 바로 커서를 넘겨, 다른 세션 메시지로 꽉 찬 로그에서도 막히지 않는다.
+ */
+export function pollInbox(id: string): Poll {
+  const none: Poll = { msgs: [], commit() {}, release() {} };
+  const unlock = lock(id);
+  if (!unlock) return none;
+  let handedOff = false;
+  try {
+    const cur = path.join(CURSORS, safe(id));
+    const saved = readCursor(cur);
+    const size = fs.statSync(LOG).size;
+    // 첫 읽기(커서 없음): 과거 직접 메시지는 받고, 브로드캐스트는 등록 이후(since) 것만 받는다
+    const since = saved === undefined ? (getAgent(id)?.since ?? size) : 0;
+    // 로그가 비워졌는데 커서가 남아 있으면(수동 정리 등) 처음부터 다시 읽는다
+    let off = saved !== undefined && saved > size ? 0 : (saved ?? 0);
+    const fd = fs.openSync(LOG, "r");
+    try {
+      while (off < size) {
+        const len = Math.min(size - off, CHUNK);
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, off);
+        // 마지막 줄이 미완성일 수 있으니 개행까지만 소비. 한 줄이 CHUNK보다 크면(비정상) 건너뛴다.
+        let end = buf.lastIndexOf(10) + 1;
+        if (end === 0) {
+          if (len < CHUNK) break; // 아직 쓰는 중인 줄
+          end = len;
+        }
+        const msgs: Message[] = [];
+        const ends: number[] = [];
+        let pos = 0;
+        while (pos < end) {
+          const nl = buf.indexOf(10, pos);
+          const stop = nl < 0 || nl >= end ? end : nl + 1;
+          const start = off + pos;
+          const line = buf.subarray(pos, stop).toString("utf8").trim();
+          pos = stop;
+          if (!line) continue;
+          let m: Message;
+          try {
+            m = JSON.parse(line);
+          } catch {
+            continue; // 깨진 줄(동시 기록 충돌, 디스크 풀 등)은 건너뛴다
+          }
+          if (!m || typeof m.body !== "string" || m.from === id) continue;
+          if (m.to === id || (m.to === "*" && start >= since)) {
+            msgs.push(m);
+            ends.push(off + pos);
+          }
+        }
+        const chunkEnd = off + end;
+        if (!msgs.length) {
+          advance(cur, chunkEnd, size); // 내 것이 없는 구간은 바로 넘긴다
+          off = chunkEnd;
+          continue;
+        }
+        let done = false;
+        const finish = (k: number) => {
+          if (done) return;
+          done = true;
+          try {
+            if (k >= msgs.length) advance(cur, chunkEnd, size);
+            else if (k > 0) advance(cur, ends[k - 1], size);
+          } finally {
+            unlock();
+          }
+        };
+        handedOff = true;
+        return { msgs, commit: (k) => finish(k ?? msgs.length), release: () => finish(0) };
+      }
+      if (saved === undefined) advance(cur, off, size); // 빈 로그여도 구독을 시작한 것으로 기록
+    } finally {
+      fs.closeSync(fd);
+    }
+  } finally {
+    if (!handedOff) unlock();
+  }
+  return none;
 }
 
 /** peek=true면 커서를 전진시키지 않음. */
 export function readInbox(id: string, peek = false): Message[] {
-  const { msgs, commit } = pollInbox(id);
-  if (!peek) commit();
-  return msgs;
+  const p = pollInbox(id);
+  if (peek) p.release();
+  else p.commit();
+  return p.msgs;
 }
 
 export function format(msgs: Message[]): string {

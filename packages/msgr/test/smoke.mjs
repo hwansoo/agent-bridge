@@ -83,6 +83,37 @@ try {
   try { execFileSync("node", [CLI, "setup", "--dry-run"], { env: { ...env, HOME: "" }, stdio: "pipe" }); } catch (e) { refused = e.status === 1; }
   ok(refused, "setup: HOME이 비어 있으면 거부");
 
+  // 8b) setup이 사용자 설정을 보존: 같은 그룹의 다른 훅 유지, 깨진 JSON은 건드리지 않음
+  {
+    const FH = path.join(H, "fakehome"), BIN = path.join(H, "fakebin");
+    fs.mkdirSync(path.join(FH, ".claude"), { recursive: true });
+    fs.mkdirSync(BIN, { recursive: true });
+    fs.writeFileSync(path.join(BIN, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o755 }); // mcp add/remove 흉내
+    const senv = { ...env, HOME: FH, PATH: `${BIN}:${process.env.PATH}` };
+    const settings = path.join(FH, ".claude/settings.json");
+    const oldMsgr = `node /old/place/msgr/dist/cli.js inbox --hook`;
+    fs.writeFileSync(settings, JSON.stringify({ model: "keep", hooks: { UserPromptSubmit: [
+      { matcher: "m1", hooks: [{ type: "command", command: oldMsgr }, { type: "command", command: "echo keep-me" }] },
+      { hooks: [{ type: "command", command: "echo other-group" }] },
+    ] } }));
+    execFileSync("node", [CLI, "setup", "--only", "claude"], { env: senv, stdio: "pipe" });
+    const j = JSON.parse(fs.readFileSync(settings, "utf8"));
+    const cmds = j.hooks.UserPromptSubmit.flatMap((g) => g.hooks.map((h) => h.command));
+    const g1 = j.hooks.UserPromptSubmit.find((g) => g.matcher === "m1");
+    ok(j.model === "keep" && cmds.includes("echo keep-me") && cmds.includes("echo other-group") && !cmds.includes(oldMsgr)
+      && cmds.filter((c) => /cli\.js inbox --hook/.test(c)).length === 1 && g1?.hooks.length === 1,
+      "setup: 같은 그룹의 다른 훅과 그룹 속성 보존, 옛 msgr 훅만 교체", JSON.stringify(j));
+    execFileSync("node", [CLI, "setup", "--uninstall", "--only", "claude"], { env: senv, stdio: "pipe" });
+    const u = JSON.parse(fs.readFileSync(settings, "utf8"));
+    const ucmds = (u.hooks?.UserPromptSubmit ?? []).flatMap((g) => g.hooks.map((h) => h.command));
+    ok(ucmds.includes("echo keep-me") && !ucmds.some((c) => /cli\.js/.test(c)) && !u.hooks?.SessionStart, "setup --uninstall: msgr 훅만 제거", JSON.stringify(u));
+    const broken = '{ "model": "x", oops';
+    fs.writeFileSync(settings, broken);
+    let st = 0;
+    try { execFileSync("node", [CLI, "setup", "--only", "claude"], { env: senv, stdio: "pipe" }); } catch (e) { st = e.status; }
+    ok(st === 1 && fs.readFileSync(settings, "utf8") === broken, "setup: 깨진 설정 파일은 덮어쓰지 않고 실패로 보고");
+  }
+
   // 9) gc: 고아 파일 정리 / audit 로테이션
   fs.writeFileSync(path.join(H, "cursors", "ghost_agent"), "0");
   ok(/삭제: cursors\/ghost_agent/.test(cli(["gc", "--dry-run"])) && fs.existsSync(path.join(H, "cursors", "ghost_agent")), "gc --dry-run: 보고만 하고 삭제하지 않음");

@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Backoff, RateWindow } from "./ratelimit.js";
 import { buildPush } from "./push-text.js";
-import { type Agent, envNum, getPin, pollInbox } from "./store.js";
+import { type Agent, type Poll, envNum, getPin, pollInbox } from "./store.js";
 
 const BIN =
   process.env.MSGR_OPENCODE_BIN ??
@@ -64,10 +64,12 @@ export function startOpencodePush(getMe: () => Agent | undefined, log: (m: strin
     const me = getMe();
     if (!me || busy || !backoff.ready()) return;
     busy = true;
+    let poll: Poll | undefined;
     try {
-      const { msgs, commit } = pollInbox(me.id);
+      poll = pollInbox(me.id);
+      const { msgs, commit } = poll;
       if (!msgs.length) return;
-      if (!rate.allow()) return; // 루프 방지: 커밋하지 않고 다음 기회에 전달
+      if (!rate.allow()) return; // 루프 방지: 커밋하지 않고 다음 기회에(finally에서 잠금 해제) 전달
       const session = await pickSession(me.cwd, getPin(me.id));
       if (!session) return backoff.fail(), logOnce("최근 " + (process.env.MSGR_OC_STALE_MIN ?? 60) + "분 안의 opencode 세션이 없어 주입을 보류(프롬프트를 한 번 입력하면 전달됨, cwd=" + me.cwd + ")");
       const { text, count } = buildPush(me.id, msgs);
@@ -85,6 +87,7 @@ export function startOpencodePush(getMe: () => Agent | undefined, log: (m: strin
       backoff.fail();
       log("push 실패: " + (e as Error).message);
     } finally {
+      poll?.release(); // 커밋했으면 무시됨. 전달 못 했으면 잠금만 풀어 다음에 재시도
       busy = false;
     }
   };

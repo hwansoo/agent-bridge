@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { CodexRpc } from "./codex-rpc.js";
 import { Backoff, RateWindow } from "./ratelimit.js";
 import { buildPush } from "./push-text.js";
-import { type Agent, envNum, getPin, pollInbox } from "./store.js";
+import { type Agent, type Poll, envNum, getPin, pollInbox } from "./store.js";
 
 const MAX_PUSH_PER_MIN = envNum("MSGR_MAX_PUSH_PER_MIN", 6);
 const POLL_MS = Math.max(500, envNum("MSGR_POLL_MS", 2000));
@@ -50,11 +50,13 @@ export function startCodexPush(getMe: () => Agent | undefined, log: (m: string) 
     const me = getMe();
     if (!me || busy || !backoff.ready()) return;
     busy = true;
+    let poll: Poll | undefined;
     let rpc: CodexRpc | undefined;
     try {
-      const { msgs, commit } = pollInbox(me.id);
+      poll = pollInbox(me.id);
+      const { msgs, commit } = poll;
       if (!msgs.length) return;
-      if (!rate.allow()) return; // 루프 방지: 커밋하지 않고 다음 기회에
+      if (!rate.allow()) return; // 루프 방지: 커밋하지 않고 다음 기회에(finally에서 잠금 해제)
       rpc = await CodexRpc.connect(undefined, "msgr");
       const t = await pickThread(rpc, me.cwd, getPin(me.id));
       if (!t.id) return backoff.fail(), log(t.busy ? "codex 스레드가 작업 중 — 나중에 재시도" : "codex 스레드를 찾지 못함(cwd=" + me.cwd + ")");
@@ -68,6 +70,7 @@ export function startCodexPush(getMe: () => Agent | undefined, log: (m: string) 
       backoff.fail();
       log("push 실패: " + (e as Error).message);
     } finally {
+      poll?.release(); // 커밋했으면 무시됨. 전달 못 했으면 잠금만 풀어 다음에 재시도
       rpc?.close();
       busy = false;
     }

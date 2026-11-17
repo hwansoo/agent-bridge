@@ -57,15 +57,27 @@ export function setup(args: string[]) {
   const backup = (file: string) => {
     if (dry || !fs.existsSync(file)) return;
     const bak = `${file}.bak-msgr`;
-    if (!fs.existsSync(bak)) fs.copyFileSync(file, bak); // 최초 1회만 백업
+    if (!fs.existsSync(bak)) fs.copyFileSync(file, bak); // msgr 설치 전 원본(최초 1회)
+    fs.copyFileSync(file, `${file}.bak-msgr-last`); // 이번 변경 직전 상태(매번 갱신)
   };
+  /** 파일이 없으면 {}(새로 만듦). 읽기·파싱에 실패하면 undefined: 호출부는 그 파일을 건드리지 않고 실패로 보고한다. */
   const readJson = (file: string): any => {
+    let raw: string;
     try {
-      return JSON.parse(fs.readFileSync(file, "utf8"));
+      raw = fs.readFileSync(file, "utf8");
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === "ENOENT" ? {} : undefined;
+    }
+    if (!raw.trim()) return {};
+    try {
+      const j = JSON.parse(raw);
+      return j && typeof j === "object" && !Array.isArray(j) ? j : undefined;
     } catch {
       return undefined;
     }
   };
+  const badJson = (tool: string, file: string) =>
+    say(tool, "fail", `${file} 을(를) 읽거나 해석할 수 없어 건드리지 않았습니다. 파일을 고친 뒤 다시 실행하세요.`);
   const writeJson = (file: string, obj: unknown) => {
     if (dry) return;
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -73,11 +85,18 @@ export function setup(args: string[]) {
   };
   const isOurs = (cmd?: string) => typeof cmd === "string" && /msgr|dist\/cli\.js (inbox --hook|session-start)/.test(cmd) && /cli\.js/.test(cmd);
 
-  /** Claude/Codex 스타일 훅({hooks:{Event:[{hooks:[{command}]}]}})에서 우리 항목만 제거 후 선택적으로 추가 */
+  /**
+   * Claude/Codex 스타일 훅({hooks:{Event:[{matcher?, hooks:[{command}]}]}})에서 msgr 명령만 제거하고
+   * (같은 그룹의 다른 명령과 그룹 속성은 보존, 비게 된 그룹만 삭제) 선택적으로 msgr 그룹을 추가한다.
+   */
   const mergeNestedHook = (hooksObj: any, event: string, command: string | null, extra: object = {}) => {
-    hooksObj[event] = (hooksObj[event] ?? []).filter(
-      (g: any) => !(g.hooks ?? []).some((h: any) => isOurs(h.command)),
-    );
+    const groups = Array.isArray(hooksObj[event]) ? hooksObj[event] : [];
+    hooksObj[event] = groups.flatMap((g: any) => {
+      if (!g || !Array.isArray(g.hooks)) return [g];
+      const rest = g.hooks.filter((h: any) => !isOurs(h?.command));
+      if (rest.length === g.hooks.length) return [g];
+      return rest.length ? [{ ...g, hooks: rest }] : [];
+    });
     if (command) hooksObj[event].push({ hooks: [{ type: "command", command, ...extra }] });
     if (!hooksObj[event].length) delete hooksObj[event];
   };
@@ -92,14 +111,17 @@ export function setup(args: string[]) {
         say("claude", r.ok ? "ok" : "fail", r.ok ? "MCP 서버 등록(user)" : `MCP 등록 실패: ${r.out}`);
       } else say("claude", "ok", "MCP 서버 제거");
       const f = path.join(HOME, ".claude/settings.json");
-      const j = readJson(f) ?? {};
-      backup(f);
-      j.hooks ??= {};
-      mergeNestedHook(j.hooks, "UserPromptSubmit", uninstall ? null : `${NODE} ${CLI} inbox --hook`);
-      mergeNestedHook(j.hooks, "SessionStart", uninstall ? null : `${NODE} ${CLI} session-start`);
-      if (!Object.keys(j.hooks).length) delete j.hooks;
-      writeJson(f, j);
-      say("claude", "ok", `훅 ${uninstall ? "제거" : "설치"} (UserPromptSubmit, SessionStart) → ${f}`);
+      const j = readJson(f);
+      if (!j) badJson("claude", f);
+      else {
+        backup(f);
+        if (!j.hooks || typeof j.hooks !== "object") j.hooks = {};
+        mergeNestedHook(j.hooks, "UserPromptSubmit", uninstall ? null : `${NODE} ${CLI} inbox --hook`);
+        mergeNestedHook(j.hooks, "SessionStart", uninstall ? null : `${NODE} ${CLI} session-start`);
+        if (!Object.keys(j.hooks).length) delete j.hooks;
+        writeJson(f, j);
+        say("claude", "ok", `훅 ${uninstall ? "제거" : "설치"} (UserPromptSubmit, SessionStart) → ${f}`);
+      }
     }
   }
 
@@ -109,12 +131,15 @@ export function setup(args: string[]) {
     else {
       const f = path.join(HOME, ".config/opencode/opencode.json");
       const j = readJson(f);
-      if (j?.mcp?.servers?.msgr) {
+      if (!j) badJson("opencode", f);
+      else if (j?.mcp?.servers?.msgr) {
         backup(f);
         delete j.mcp.servers.msgr; // 멱등: 지우고 다시 add
         writeJson(f, j);
       }
-      if (!uninstall) {
+      if (!j) {
+        // 설정 파일이 깨져 있으면 opencode mcp add도 덮어쓸 수 있으므로 건너뛴다
+      } else if (!uninstall) {
         const r = run("opencode", ["mcp", "add", "--global", "msgr", "--", NODE, SERVER]);
         say("opencode", r.ok ? "ok" : "fail", r.ok ? `MCP 서버 등록(global) → ${f}` : `MCP 등록 실패: ${r.out}`);
         if (r.ok && !dry) say("opencode", "skip", "OpenCode 서비스를 재시작해야 적용됩니다: opencode service restart");
@@ -132,18 +157,21 @@ export function setup(args: string[]) {
         say("codex", r.ok ? "ok" : "fail", r.ok ? "MCP 서버 등록" : `MCP 등록 실패: ${r.out}`);
       } else say("codex", "ok", "MCP 서버 제거");
       const f = path.join(HOME, ".codex/hooks.json");
-      const j = readJson(f) ?? {};
-      backup(f);
-      j.hooks ??= {};
-      mergeNestedHook(j.hooks, "UserPromptSubmit", uninstall ? null : `${NODE} ${CLI} inbox --hook --tool codex`, { timeout: 10 });
-      if (!Object.keys(j.hooks).length) delete j.hooks;
-      if (uninstall && !Object.keys(j).filter((k) => k !== "description").length) {
-        if (!dry) fs.rmSync(f, { force: true });
-      } else {
-        j.description ??= "msgr: 다른 에이전트 세션의 새 메시지를 프롬프트 직전에 주입";
-        writeJson(f, j);
+      const j = readJson(f);
+      if (!j) badJson("codex", f);
+      else {
+        backup(f);
+        if (!j.hooks || typeof j.hooks !== "object") j.hooks = {};
+        mergeNestedHook(j.hooks, "UserPromptSubmit", uninstall ? null : `${NODE} ${CLI} inbox --hook --tool codex`, { timeout: 10 });
+        if (!Object.keys(j.hooks).length) delete j.hooks;
+        if (uninstall && !Object.keys(j).filter((k) => k !== "description").length) {
+          if (!dry) fs.rmSync(f, { force: true });
+        } else {
+          j.description ??= "msgr: 다른 에이전트 세션의 새 메시지를 프롬프트 직전에 주입";
+          writeJson(f, j);
+        }
+        say("codex", "ok", `훅 ${uninstall ? "제거" : "설치"} (UserPromptSubmit) → ${f}`);
       }
-      say("codex", "ok", `훅 ${uninstall ? "제거" : "설치"} (UserPromptSubmit) → ${f}`);
       if (!uninstall) say("codex", "skip", "처음에는 Codex에서 /hooks 로 훅을 한 번 신뢰(검토)해야 실행됩니다");
     }
   }
@@ -158,7 +186,9 @@ export function setup(args: string[]) {
         say("agy", r.ok ? "ok" : "fail", r.ok ? "MCP 서버 등록" : `MCP 등록 실패: ${r.out}`);
       } else say("agy", "ok", "MCP 서버 제거");
       const f = path.join(HOME, ".gemini/config/hooks.json");
-      const j = readJson(f) ?? {};
+      const j = readJson(f);
+      if (!j) badJson("agy", f);
+      else {
       backup(f);
       if (uninstall) delete j.msgr;
       else
@@ -171,6 +201,7 @@ export function setup(args: string[]) {
         if (!dry) fs.rmSync(f, { force: true });
       } else writeJson(f, j);
       say("agy", "ok", `훅 ${uninstall ? "제거" : "설치"} (PreInvocation) → ${f}`);
+      }
     }
   }
 

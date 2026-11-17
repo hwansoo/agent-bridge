@@ -11,10 +11,15 @@
 
 ## 위임 스킬 설치
 
+macOS / Linux / WSL / Windows(Git Bash):
+
 ```sh
-mkdir -p ~/.claude/skills
-cp -r skills/opencode-delegate ~/.claude/skills/
+curl -fsSL https://raw.githubusercontent.com/hwansoo/agent-bridge/main/install.sh | bash
 ```
+
+제거는 `... | bash -s -- --uninstall`, msgr까지 설치하려면 `... | bash -s -- --with-msgr`(설정 파일은 건드리지 않고, 등록은 `setup --dry-run`으로 확인한 뒤 직접 실행). 스크립트를 먼저 읽어 보고 싶다면 [install.sh](install.sh)를 확인하세요.
+
+Windows/WSL 검증 절차: [docs/windows-wsl-checklist.md](docs/windows-wsl-checklist.md)
 
 위임에 쓸 모델은 `-m`, 환경변수 `OPENCODE_DELEGATE_MODEL`, 또는 `~/.config/opencode-delegate/model` 파일로 지정합니다. 자세한 사용법은 [SKILL.md](skills/opencode-delegate/SKILL.md)를 보세요.
 

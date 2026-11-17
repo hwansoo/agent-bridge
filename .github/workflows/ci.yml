@@ -1,0 +1,24 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  msgr:
+    strategy:
+      matrix: { os: [ubuntu-latest, macos-latest] }
+    runs-on: ${{ matrix.os }}
+    defaults: { run: { working-directory: packages/msgr } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: packages/msgr/package-lock.json }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - run: npm test
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh skills/opencode-delegate/delegate.sh
+      - run: bash -n install.sh && bash -n skills/opencode-delegate/delegate.sh

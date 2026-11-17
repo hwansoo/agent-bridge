@@ -44,7 +44,7 @@ args=(run --agent "$mode" --format json --archived --title "${title:-delegate-$m
 # 로그(프롬프트와 결과 전체)는 사용자 전용 위치에 둔다. 공용 /tmp는 다른 사용자가 읽거나 가로챌 수 있다.
 umask 077
 dir="${OPENCODE_DELEGATE_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/opencode-delegate}"
-mkdir -p "$dir" && chmod 700 "$dir" || { echo "로그 디렉터리를 만들 수 없습니다: $dir" >&2; exit 1; }
+if ! { mkdir -p "$dir" && chmod 700 "$dir"; }; then echo "로그 디렉터리를 만들 수 없습니다: $dir" >&2; exit 1; fi
 # 오래된 로그 정리(기본 7일)
 find "$dir" -type f \( -name '*.jsonl' -o -name '*.err' \) -mtime +"${OPENCODE_DELEGATE_LOG_DAYS:-7}" -delete 2>/dev/null
 ts="$(date +%Y%m%d-%H%M%S)-$$"

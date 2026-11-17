@@ -2,11 +2,12 @@
 // 같은 폴더의 유휴 스레드에 turn/start로 주입한다. 작업 중이면 커밋하지 않고 다음 주기에 재시도.
 import fs from "node:fs";
 import { CodexRpc } from "./codex-rpc.js";
-import { RateWindow } from "./ratelimit.js";
-import { type Agent, format, getPin, pollInbox } from "./store.js";
+import { Backoff, RateWindow } from "./ratelimit.js";
+import { buildPush } from "./push-text.js";
+import { type Agent, envNum, getPin, pollInbox } from "./store.js";
 
-const MAX_PUSH_PER_MIN = Number(process.env.MSGR_MAX_PUSH_PER_MIN ?? 6);
-const POLL_MS = Number(process.env.MSGR_POLL_MS ?? 2000);
+const MAX_PUSH_PER_MIN = envNum("MSGR_MAX_PUSH_PER_MIN", 6);
+const POLL_MS = Math.max(500, envNum("MSGR_POLL_MS", 2000));
 
 const real = (x: string) => {
   try {
@@ -43,10 +44,11 @@ export async function pickThread(rpc: CodexRpc, cwd: string, pin?: string): Prom
 
 export function startCodexPush(getMe: () => Agent | undefined, log: (m: string) => void = () => {}) {
   const rate = new RateWindow(MAX_PUSH_PER_MIN);
+  const backoff = new Backoff(POLL_MS, 60_000); // 세션 없음/작업 중/실패가 이어지면 재시도 간격을 늘림
   let busy = false;
   const tick = async () => {
     const me = getMe();
-    if (!me || busy) return;
+    if (!me || busy || !backoff.ready()) return;
     busy = true;
     let rpc: CodexRpc | undefined;
     try {
@@ -55,15 +57,15 @@ export function startCodexPush(getMe: () => Agent | undefined, log: (m: string) 
       if (!rate.allow()) return; // 루프 방지: 커밋하지 않고 다음 기회에
       rpc = await CodexRpc.connect(undefined, "msgr");
       const t = await pickThread(rpc, me.cwd, getPin(me.id));
-      if (!t.id) return log(t.busy ? "codex 스레드가 작업 중 — 나중에 재시도" : "codex 스레드를 찾지 못함(cwd=" + me.cwd + ")");
-      const text =
-        `📨 msgr: 다른 에이전트 세션으로부터 메시지 ${msgs.length}건 (나=${me.id})\n${format(msgs)}\n\n` +
-        `(답장이 필요하면 msgr의 send_message 도구를 쓰세요. 단순 확인/알림 메시지에는 답장하지 마세요.)`;
+      if (!t.id) return backoff.fail(), log(t.busy ? "codex 스레드가 작업 중 — 나중에 재시도" : "codex 스레드를 찾지 못함(cwd=" + me.cwd + ")");
+      const { text, count } = buildPush(me.id, msgs);
       await rpc.request("turn/start", { threadId: t.id, input: [{ type: "text", text, text_elements: [] }] });
-      commit();
+      commit(count);
       rate.record();
-      log(`pushed ${msgs.length} msg(s) -> ${t.id}`);
+      backoff.ok();
+      log(`pushed ${count} msg(s) -> ${t.id}`);
     } catch (e) {
+      backoff.fail();
       log("push 실패: " + (e as Error).message);
     } finally {
       rpc?.close();

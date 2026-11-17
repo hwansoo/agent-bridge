@@ -14,3 +14,21 @@ export class RateWindow {
     this.hits.push(now);
   }
 }
+
+/** 실패/보류가 이어질 때 재시도 간격을 늘린다(2s → 4s → … → 최대 maxMs). 성공하면 초기화. */
+export class Backoff {
+  private fails = 0;
+  private until = 0;
+  constructor(private baseMs = 2000, private maxMs = 5 * 60_000) {}
+  ready(now = Date.now()) {
+    return now >= this.until;
+  }
+  fail(now = Date.now()) {
+    this.fails++;
+    this.until = now + Math.min(this.maxMs, this.baseMs * 2 ** (this.fails - 1));
+  }
+  ok() {
+    this.fails = 0;
+    this.until = 0;
+  }
+}

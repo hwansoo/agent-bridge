@@ -29,7 +29,18 @@ export function setup(args: string[]) {
   const dry = args.includes("--dry-run");
   const uninstall = args.includes("--uninstall");
   const onlyIdx = args.indexOf("--only");
-  const only = onlyIdx >= 0 ? args[onlyIdx + 1].split(",") : ["claude", "opencode", "codex", "agy"];
+  const ALL = ["claude", "opencode", "codex", "agy"];
+  const onlyVal = onlyIdx >= 0 ? args[onlyIdx + 1] : undefined;
+  if (onlyIdx >= 0 && (!onlyVal || onlyVal.startsWith("--"))) {
+    console.error(`--only 에는 값이 필요합니다(예: --only claude,codex). 가능한 값: ${ALL.join(",")}`);
+    process.exit(1);
+  }
+  const only = onlyVal ? onlyVal.split(",") : ALL;
+  const unknown = only.filter((t) => !ALL.includes(t));
+  if (unknown.length) {
+    console.error(`알 수 없는 도구: ${unknown.join(",")} (가능한 값: ${ALL.join(",")})`);
+    process.exit(1);
+  }
 
   if (!fs.existsSync(SERVER) || !fs.existsSync(CLI)) {
     console.error(`dist가 없습니다(${DIST}). 먼저 npm run build 를 실행하세요.`);

@@ -14,12 +14,14 @@ mode="${1:-}"
 case "$mode" in plan|build) shift ;; *) usage; exit 2 ;; esac
 
 model=""; session=""; worktree=""; auto=0; title=""
+# 값이 필요한 옵션: 값이 없거나 다른 옵션이면 중단(그대로 두면 shift 2 실패로 무한 루프)
+need() { if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then echo "$1 에는 값이 필요합니다." >&2; usage; exit 2; fi; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    -m) model="${2:-}"; shift 2 ;;
-    -s) session="${2:-}"; shift 2 ;;
-    -w) worktree="${2:-}"; shift 2 ;;
-    -t) title="${2:-}"; shift 2 ;;
+    -m) need "$@"; model="$2"; shift 2 ;;
+    -s) need "$@"; session="$2"; shift 2 ;;
+    -w) need "$@"; worktree="$2"; shift 2 ;;
+    -t) need "$@"; title="$2"; shift 2 ;;
     -y) auto=1; shift ;;
     --) shift; break ;;
     *) echo "알 수 없는 옵션: $1" >&2; usage; exit 2 ;;
@@ -39,8 +41,12 @@ args=(run --agent "$mode" --format json --archived --title "${title:-delegate-$m
 [ -n "$worktree" ] && args+=(--worktree "$worktree")
 [ "$auto" = 1 ]    && args+=(--auto)
 
-dir="${TMPDIR:-/tmp}/opencode-delegate"
-mkdir -p "$dir"
+# 로그(프롬프트와 결과 전체)는 사용자 전용 위치에 둔다. 공용 /tmp는 다른 사용자가 읽거나 가로챌 수 있다.
+umask 077
+dir="${OPENCODE_DELEGATE_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/opencode-delegate}"
+mkdir -p "$dir" && chmod 700 "$dir" || { echo "로그 디렉터리를 만들 수 없습니다: $dir" >&2; exit 1; }
+# 오래된 로그 정리(기본 7일)
+find "$dir" -type f \( -name '*.jsonl' -o -name '*.err' \) -mtime +"${OPENCODE_DELEGATE_LOG_DAYS:-7}" -delete 2>/dev/null
 ts="$(date +%Y%m%d-%H%M%S)-$$"
 log="$dir/$ts.jsonl"; err="$dir/$ts.err"
 

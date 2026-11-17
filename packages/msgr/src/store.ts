@@ -9,8 +9,20 @@ const CURSORS = path.join(ROOT, "cursors");
 const AGENTS = path.join(ROOT, "agents");
 const PINS = path.join(ROOT, "pins");
 const WATCHERS = path.join(ROOT, "watchers");
-for (const d of [ROOT, CURSORS, AGENTS, PINS, WATCHERS]) fs.mkdirSync(d, { recursive: true });
-fs.closeSync(fs.openSync(LOG, "a"));
+// 메시지 본문이 다른 로컬 사용자에게 보이지 않도록 저장소 전체를 소유자 전용(0700)으로 둔다
+for (const d of [ROOT, CURSORS, AGENTS, PINS, WATCHERS]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+try {
+  fs.chmodSync(ROOT, 0o700); // 이전 버전이 755로 만든 경우도 바로잡는다
+} catch {}
+fs.closeSync(fs.openSync(LOG, "a", 0o600));
+
+/** 숫자 환경변수(잘못된 값이면 기본값) */
+export const envNum = (name: string, def: number): number => {
+  const v = Number(process.env[name]);
+  return process.env[name] !== undefined && Number.isFinite(v) && v >= 0 ? v : def;
+};
+/** 메시지 본문 최대 크기(바이트). 커맨드라인 인자 한도(Linux 128KB)와 로그 비대화를 막는다. */
+export const MAX_BODY = envNum("MSGR_MAX_BODY", 32 * 1024);
 
 export interface Message {
   id: string;
@@ -41,7 +53,7 @@ const agentFile = (id: string) => path.join(AGENTS, safe(id) + ".json");
 
 export function makeId(tool: string, cwd: string, sessionId?: string): { id: string; folder: string } {
   const folder = path.basename(cwd) || "root";
-  const short = (sessionId ?? randomUUID()).replace(/-/g, "").slice(0, 4);
+  const short = (sessionId ?? randomUUID()).replace(/-/g, "").slice(0, 6);
   return { id: `${tool}:${folder}#${short}`, folder };
 }
 
@@ -65,7 +77,9 @@ export function heartbeat(id: string, patch: Partial<Agent> = {}) {
 }
 
 export function unregister(id: string) {
-  for (const f of [agentFile(id), path.join(CURSORS, safe(id)), path.join(PINS, safe(id)), path.join(WATCHERS, safe(id) + ".pid"), path.join(WATCHERS, safe(id) + ".nudge")]) fs.rmSync(f, { force: true });
+  // 커서와 핀은 남긴다: 같은 세션이 재개되면(같은 id) 이어서 읽어야 과거 메시지가 다시 주입되지 않는다.
+  // 남은 파일은 레지스트리 항목이 24시간 뒤 사라진 다음 gc가 정리한다.
+  for (const f of [agentFile(id), path.join(WATCHERS, safe(id) + ".pid"), path.join(WATCHERS, safe(id) + ".nudge")]) fs.rmSync(f, { force: true });
 }
 
 export function listAgents(maxAgeMs = 3 * 60_000): Agent[] {
@@ -235,6 +249,8 @@ export function gc(dryRun = false): string[] {
 // ---------- 메시지 ----------
 
 export function send(from: string, to: string, body: string, thread?: string): Message {
+  const n = Buffer.byteLength(body);
+  if (n > MAX_BODY) throw new Error(`메시지가 너무 큽니다(${n}B > ${MAX_BODY}B). 내용을 파일로 저장하고 경로를 보내세요.`);
   const m: Message = { id: randomUUID(), ts: new Date().toISOString(), from, to, thread, body };
   // 한 줄 append는 (PIPE_BUF 이하에서) 원자적이라 락 없이 충분
   fs.appendFileSync(LOG, JSON.stringify(m) + "\n");
@@ -270,8 +286,8 @@ export function checkSendAllowed(
   from: string,
   to: string,
   limits = {
-    maxPerPair: Number(process.env.MSGR_MAX_SEND_PER_MIN ?? 10),
-    maxPingPong: Number(process.env.MSGR_MAX_PINGPONG_PER_MIN ?? 16),
+    maxPerPair: envNum("MSGR_MAX_SEND_PER_MIN", 10),
+    maxPingPong: envNum("MSGR_MAX_PINGPONG_PER_MIN", 16),
   },
 ): { ok: true } | { ok: false; reason: string } {
   const recent = recentMessages(60_000);
@@ -286,33 +302,68 @@ export function checkSendAllowed(
   return { ok: true };
 }
 
-/** 바이트 오프셋 커서로 새 메시지를 훑는다. commit()을 호출해야 커서가 전진한다. */
-export function pollInbox(id: string): { msgs: Message[]; commit: () => void } {
-  const cur = path.join(CURSORS, safe(id));
-  let off = 0;
-  let first = false;
+const CHUNK = 4 * 1024 * 1024; // 한 번에 읽는 최대 크기
+
+function readCursor(cur: string): number | undefined {
   try {
-    off = Number(fs.readFileSync(cur, "utf8")) || 0;
+    const v = Number(fs.readFileSync(cur, "utf8"));
+    return Number.isFinite(v) && v >= 0 ? v : 0;
   } catch {
-    // 첫 구독: 처음부터 읽되, 과거 브로드캐스트는 소음이라 직접 메시지만 받는다
-    first = true;
+    return undefined;
   }
+}
+
+/**
+ * 바이트 오프셋 커서로 새 메시지를 훑는다. commit()을 호출해야 커서가 전진한다.
+ * commit(k)는 앞의 k건까지만 소비한 것으로 기록한다(나머지는 다음에 다시 나온다).
+ * 커서는 앞으로만 움직인다(여러 소비자가 동시에 커밋해도 뒤로 돌아가 중복 전달되지 않게).
+ */
+export function pollInbox(id: string): { msgs: Message[]; commit: (k?: number) => void } {
+  const cur = path.join(CURSORS, safe(id));
+  const saved = readCursor(cur);
+  // 첫 구독: 처음부터 읽되, 과거 브로드캐스트는 소음이라 직접 메시지만 받는다
+  const first = saved === undefined;
   const size = fs.statSync(LOG).size;
+  // 로그가 비워졌는데 커서가 남아 있으면(수동 정리 등) 처음부터 다시 읽는다
+  const off = saved !== undefined && saved > size ? 0 : (saved ?? 0);
   if (size <= off) return { msgs: [], commit() {} };
+  const len = Math.min(size - off, CHUNK);
   const fd = fs.openSync(LOG, "r");
-  const buf = Buffer.alloc(size - off);
-  fs.readSync(fd, buf, 0, buf.length, off);
+  const buf = Buffer.alloc(len);
+  fs.readSync(fd, buf, 0, len, off);
   fs.closeSync(fd);
-  // 마지막 줄이 미완성일 수 있으니 개행까지만 소비
-  const end = buf.lastIndexOf(10) + 1;
-  const msgs = buf
-    .subarray(0, end)
-    .toString("utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => JSON.parse(l) as Message)
-    .filter((m) => m.from !== id && (m.to === id || (!first && m.to === "*")));
-  return { msgs, commit: () => fs.writeFileSync(cur, String(off + end)) };
+  // 마지막 줄이 미완성일 수 있으니 개행까지만 소비. 한 줄이 CHUNK보다 크면(비정상) 건너뛴다.
+  let end = buf.lastIndexOf(10) + 1;
+  if (end === 0 && len === CHUNK) end = len;
+  const msgs: Message[] = [];
+  const ends: number[] = [];
+  let pos = 0;
+  while (pos < end) {
+    const nl = buf.indexOf(10, pos);
+    const stop = nl < 0 || nl >= end ? end : nl + 1;
+    const line = buf.subarray(pos, stop).toString("utf8").trim();
+    pos = stop;
+    if (!line) continue;
+    let m: Message;
+    try {
+      m = JSON.parse(line);
+    } catch {
+      continue; // 깨진 줄(동시 기록 충돌, 디스크 풀 등)은 건너뛴다
+    }
+    if (!m || typeof m.body !== "string") continue;
+    if (m.from !== id && (m.to === id || (!first && m.to === "*"))) {
+      msgs.push(m);
+      ends.push(pos);
+    }
+  }
+  const commit = (k = msgs.length) => {
+    const target = off + (k >= msgs.length ? end : ends[k - 1] ?? 0);
+    if (k <= 0 && msgs.length) return;
+    const now = readCursor(cur);
+    if (now !== undefined && now > target && now <= size) return; // 다른 소비자가 이미 더 읽음
+    fs.writeFileSync(cur, String(target), { mode: 0o600 });
+  };
+  return { msgs, commit };
 }
 
 /** peek=true면 커서를 전진시키지 않음. */

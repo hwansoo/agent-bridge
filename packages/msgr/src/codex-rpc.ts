@@ -22,14 +22,22 @@ export class CodexRpc {
   static async connect(sockPath = CODEX_SOCK, clientName = "msgr", timeoutMs = 5000): Promise<CodexRpc> {
     const c = new CodexRpc();
     await c.open(sockPath, timeoutMs);
-    await c.request("initialize", { clientInfo: { name: clientName, version: "0.1.0" } });
+    try {
+      await c.request("initialize", { clientInfo: { name: clientName, version: "0.1.0" } });
+    } catch (e) {
+      c.sock.destroy();
+      throw e;
+    }
     c.send({ jsonrpc: "2.0", method: "initialized" });
     return c;
   }
 
   private open(sockPath: string, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("codex app-server 접속 시간 초과")), timeoutMs);
+      const t = setTimeout(() => {
+        this.sock.destroy();
+        reject(new Error("codex app-server 접속 시간 초과"));
+      }, timeoutMs);
       this.sock = net.connect(sockPath);
       this.sock.on("error", (e) => {
         clearTimeout(t);
@@ -52,6 +60,7 @@ export class CodexRpc {
           const head = this.buf.subarray(0, i).toString();
           if (!/^HTTP\/1\.1 101/.test(head)) {
             clearTimeout(t);
+            this.sock.destroy();
             return reject(new Error("WebSocket 업그레이드 실패: " + head.split("\r\n")[0]));
           }
           this.buf = this.buf.subarray(i + 4);

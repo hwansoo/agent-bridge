@@ -17,21 +17,36 @@ const agyArmText = () =>
   COMMON_NOTE;
 
 const [cmd, ...a] = process.argv.slice(2);
+/** --name 값(값이 없거나 다른 플래그면 undefined) */
+const flag = (name: string) => {
+  const i = a.indexOf(name);
+  const v = i >= 0 ? a[i + 1] : undefined;
+  return v && !v.startsWith("--") ? v : undefined;
+};
 switch (cmd) {
   case "send": {
     const [from, to, ...body] = a;
+    if (!from || !to || !body.length) {
+      console.error("usage: msgr send <from> <to> <body...>");
+      process.exit(1);
+    }
     const r = resolve(to);
     if ("error" in r) {
       console.error(r.error);
       process.exit(1);
     }
-    console.log(send(from, r.id, body.join(" ")).id);
+    try {
+      console.log(send(from, r.id, body.join(" ")).id);
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(1);
+    }
     break;
   }
   case "inbox": {
-    let id = a[0];
+    let id = a[0] && !a[0].startsWith("--") ? a[0] : undefined;
     const hook = a.includes("--hook");
-    const tool = a.includes("--tool") ? a[a.indexOf("--tool") + 1] : "claude-code";
+    const tool = flag("--tool") ?? "claude-code";
     if (hook) {
       // 훅: stdin JSON으로 이 세션의 에이전트를 찾는다.
       //  - Claude Code/Codex: { session_id, cwd }   - agy: { conversationId, workspacePaths[] }
@@ -46,6 +61,10 @@ switch (cmd) {
         break; // 등록된 세션이 없으면 조용히 통과
       }
       id = me.id;
+    }
+    if (!id) {
+      console.error("usage: msgr inbox <agent-id> | inbox --hook [--tool t]");
+      process.exit(1);
     }
     heartbeat(id);
     const msgs = readInbox(id);
@@ -67,7 +86,7 @@ switch (cmd) {
     //  - --once: 메시지가 오면 출력하고 즉시 종료(agy의 백그라운드 run_command 종료 → 유휴 깨우기용).
     // 사용: watch [--once] [--tool <도구>] [<agent-id>]
     const once = a.includes("--once");
-    const wtool = a.includes("--tool") ? a[a.indexOf("--tool") + 1] : "claude-code";
+    const wtool = flag("--tool") ?? "claude-code";
     const explicit = a.find((x, i) => !x.startsWith("--") && a[i - 1] !== "--tool");
     const sid = wtool === "claude-code" ? process.env.CLAUDE_CODE_SESSION_ID : undefined;
     const lookup = () => (explicit ? getAgent(explicit) : findSelf({ sessionId: sid, cwd: process.cwd(), tool: wtool }));
@@ -106,7 +125,7 @@ switch (cmd) {
   case "session-start": {
     // SessionStart 훅: 이 세션이 msgr 메시지를 유휴 중에도 받도록 대기 방법을 안내한다.
     // (agy CLI는 SessionStart 훅을 지원하지 않아 PreInvocation 훅이 같은 안내를 대신 주입한다)
-    const stool = a.includes("--tool") ? a[a.indexOf("--tool") + 1] : "claude-code";
+    const stool = flag("--tool") ?? "claude-code";
     if (stool === "agy") console.log(JSON.stringify({ injectSteps: [{ ephemeralMessage: agyArmText() }] }));
     else
       console.log(

@@ -17,7 +17,13 @@ for a in "$@"; do
   case "$a" in
     --with-msgr) with_msgr=1 ;;
     --uninstall) uninstall=1 ;;
-    -h|--help) sed -n '2,7p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help)
+      echo "사용: install.sh [--with-msgr] [--uninstall]"
+      echo "  (옵션 없음)   위임 스킬을 ~/.claude/skills/opencode-delegate 에 설치"
+      echo "  --with-msgr   msgr도 ~/.agent-bridge 에 받아 빌드(도구 등록은 직접 setup 실행)"
+      echo "  --uninstall   위임 스킬 제거"
+      echo "  AGENT_BRIDGE_REF=<태그|브랜치> 로 특정 버전을 설치할 수 있습니다(기본 main)."
+      exit 0 ;;
     *) echo "알 수 없는 옵션: $a" >&2; exit 2 ;;
   esac
 done

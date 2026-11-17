@@ -17,7 +17,7 @@ const env = { ...process.env, MSGR_HOME: H, MSGR_PUSH: "off" };
 for (const d of ["a", "b", "c", "d"]) fs.mkdirSync(path.join(H, d));
 let pass = 0, fail = 0;
 const ok = (cond, name, extra = "") => { cond ? pass++ : fail++; console.log(`${cond ? "✓" : "✗"} ${name}${!cond && extra ? "  → " + extra : ""}`); };
-const cli = (args, input) => execFileSync("node", [CLI, ...args], { env, input, encoding: "utf8" }).trim();
+const cli = (args, input) => execFileSync("node", [CLI, ...args], { env, input, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
 const mk = async (name, dir) => {
   const c = new Client({ name, version: "1" });
   await c.connect(new StdioClientTransport({ command: "node", args: [SERVER], cwd: path.join(H, dir), env }));
@@ -91,6 +91,48 @@ try {
   fs.writeFileSync(path.join(H, "audit.log"), "x".repeat(600 * 1024));
   cli(["send", "t", agI, "again"]); cli(["inbox", agI]); // audit 기록 유발
   ok(fs.existsSync(path.join(H, "audit.log.1")), "audit.log: 크기 초과 시 로테이션");
+
+  // 10) 견고성: 깨진 줄, 커서가 로그보다 큰 경우, 본문 크기 제한
+  fs.appendFileSync(path.join(H, "messages.jsonl"), "{broken json\n");
+  cli(["send", "t", agI, "after-broken"]);
+  ok(/after-broken/.test(cli(["inbox", agI])), "깨진 로그 줄은 건너뛰고 다음 메시지를 받음");
+  fs.writeFileSync(path.join(H, "cursors", agI.replace(/[^\w.-]/g, "_")), "999999999");
+  cli(["send", "t", agI, "after-reset"]);
+  ok(/after-reset/.test(cli(["inbox", agI])), "커서가 로그보다 크면 처음부터 다시 읽음");
+  let big = false;
+  try { cli(["send", "t", agI, "x".repeat(40 * 1024)]); } catch (e) { big = /너무 큽니다/.test(String(e.stderr)); }
+  ok(big, "본문 크기 제한(기본 32KB) 초과 시 거부");
+  const bigMcp = await call(cc, "send_message", { to: agI, body: "y".repeat(40 * 1024) });
+  ok(bigMcp.err && /너무 큽니다/.test(bigMcp.text), "MCP send_message도 크기 제한 오류를 돌려줌");
+
+  // 11) 세션 재개: 같은 세션 id로 다시 떠도 이미 읽은 메시지가 다시 나오지 않음
+  const renv = { ...env, MSGR_SESSION_ID: "resume-test-1" };
+  const mkR = async () => {
+    const c = new Client({ name: "claude-code", version: "1" });
+    await c.connect(new StdioClientTransport({ command: "node", args: [SERVER], cwd: path.join(H, "a"), env: renv }));
+    return c;
+  };
+  const s1 = await mkR();
+  const rid = await idOf(s1);
+  cli(["send", "t", rid, "old-msg"]);
+  const first = await call(s1, "read_inbox");
+  await s1.close();
+  await new Promise((r) => setTimeout(r, 500));
+  const s2 = await mkR();
+  ok((await idOf(s2)) === rid, "재개 시 같은 id", rid);
+  cli(["send", "t", rid, "new-msg"]);
+  const second = await call(s2, "read_inbox");
+  ok(/old-msg/.test(first.text) && /new-msg/.test(second.text) && !/old-msg/.test(second.text), "재개 후 과거 메시지 재주입 없음", second.text);
+  await s2.close();
+
+  // 12) 권한: 새 저장소는 소유자 전용
+  if (process.platform !== "win32") {
+    const H2 = path.join(H, "perm-home");
+    execFileSync("node", [CLI, "agents"], { env: { ...env, MSGR_HOME: H2 } });
+    const mode = (f) => fs.statSync(f).mode & 0o777;
+    ok(mode(H2) === 0o700 && mode(path.join(H2, "messages.jsonl")) === 0o600, "저장소 0700 / 로그 0600",
+      `${mode(H2).toString(8)} ${mode(path.join(H2, "messages.jsonl")).toString(8)}`);
+  }
 
   for (const c of [cc, oc, cx, ag]) await c.close();
 } catch (e) {

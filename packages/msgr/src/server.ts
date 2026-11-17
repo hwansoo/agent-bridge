@@ -52,8 +52,12 @@ server.tool(
     if ("error" in r) return { ...text(r.error), isError: true };
     const g = checkSendAllowed(self.id, r.id);
     if (!g.ok) return { ...text(g.reason), isError: true };
-    const m = send(self.id, r.id, body, thread);
-    return text(`sent ${m.id} -> ${r.id}`);
+    try {
+      const m = send(self.id, r.id, body, thread);
+      return text(`sent ${m.id} -> ${r.id}`);
+    } catch (e) {
+      return { ...text((e as Error).message), isError: true };
+    }
   },
 );
 

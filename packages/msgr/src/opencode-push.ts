@@ -4,8 +4,9 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RateWindow } from "./ratelimit.js";
-import { type Agent, format, getPin, pollInbox } from "./store.js";
+import { Backoff, RateWindow } from "./ratelimit.js";
+import { buildPush } from "./push-text.js";
+import { type Agent, envNum, getPin, pollInbox } from "./store.js";
 
 const BIN =
   process.env.MSGR_OPENCODE_BIN ??
@@ -14,8 +15,8 @@ const BIN =
   ) ??
   "opencode";
 
-const MAX_PUSH_PER_MIN = Number(process.env.MSGR_MAX_PUSH_PER_MIN ?? 6);
-const POLL_MS = Number(process.env.MSGR_POLL_MS ?? 2000);
+const MAX_PUSH_PER_MIN = envNum("MSGR_MAX_PUSH_PER_MIN", 6);
+const POLL_MS = Math.max(500, envNum("MSGR_POLL_MS", 2000));
 
 function oc(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) =>
@@ -52,6 +53,7 @@ export async function pickSession(cwd: string, pin?: string): Promise<string | u
 
 export function startOpencodePush(getMe: () => Agent | undefined, log: (m: string) => void = () => {}) {
   const rate = new RateWindow(MAX_PUSH_PER_MIN);
+  const backoff = new Backoff(POLL_MS, 60_000); // 세션 없음/작업 중/실패가 이어지면 재시도 간격을 늘림
   let busy = false;
   let lastLog = "";
   const logOnce = (m: string) => {
@@ -60,27 +62,27 @@ export function startOpencodePush(getMe: () => Agent | undefined, log: (m: strin
   };
   const tick = async () => {
     const me = getMe();
-    if (!me || busy) return;
+    if (!me || busy || !backoff.ready()) return;
     busy = true;
     try {
       const { msgs, commit } = pollInbox(me.id);
       if (!msgs.length) return;
       if (!rate.allow()) return; // 루프 방지: 커밋하지 않고 다음 기회에 전달
       const session = await pickSession(me.cwd, getPin(me.id));
-      if (!session) return logOnce("최근 " + (process.env.MSGR_OC_STALE_MIN ?? 60) + "분 안의 opencode 세션이 없어 주입을 보류(프롬프트를 한 번 입력하면 전달됨, cwd=" + me.cwd + ")");
-      const text =
-        `📨 msgr: 다른 에이전트 세션으로부터 메시지 ${msgs.length}건 (나=${me.id})\n${format(msgs)}\n\n` +
-        `(답장이 필요하면 msgr의 send_message 도구를 쓰세요. 단순 확인/알림 메시지에는 답장하지 마세요.)`;
+      if (!session) return backoff.fail(), logOnce("최근 " + (process.env.MSGR_OC_STALE_MIN ?? 60) + "분 안의 opencode 세션이 없어 주입을 보류(프롬프트를 한 번 입력하면 전달됨, cwd=" + me.cwd + ")");
+      const { text, count } = buildPush(me.id, msgs);
       await oc(
         ["POST", `/api/session/${session}/synthetic`, "-H", "content-type:application/json", "-d",
           JSON.stringify({ text, description: "msgr", delivery: "queue" })],
         me.cwd,
       );
-      commit();
+      commit(count);
       rate.record();
+      backoff.ok();
       lastLog = "";
-      log(`pushed ${msgs.length} msg(s) -> ${session}`);
+      log(`pushed ${count} msg(s) -> ${session}`);
     } catch (e) {
+      backoff.fail();
       log("push 실패: " + (e as Error).message);
     } finally {
       busy = false;

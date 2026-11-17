@@ -49,3 +49,4 @@ bash ~/.claude/skills/opencode-delegate/delegate.sh <plan|build> [-m 모델] [-s
 - `Free usage limit reached` → 무료 모델 한도. 다른 모델(`-m`)을 쓰거나 provider를 연결한다.
 - `opencode: command not found` → OpenCode가 PATH에 없다. Windows는 Git Bash에서, WSL은 WSL 안에서 `which opencode`를 확인한다.
 - 빈 응답 → `LOG`와 `.err` 파일(같은 폴더)을 읽어 원인을 본다.
+- 로그 위치: `~/.local/state/opencode-delegate/`(소유자 전용, 7일 지난 로그는 자동 삭제). 위치는 `OPENCODE_DELEGATE_LOG_DIR`, 보관 기간은 `OPENCODE_DELEGATE_LOG_DAYS`로 바꿀 수 있다. 로그에는 프롬프트와 결과가 모두 들어 있으므로 공유하지 않는다.

@@ -22,7 +22,7 @@ buildSync({
   target: "node22",
 });
 
-const { RateWindow } = await import(OUT);
+const { RateWindow, Backoff } = await import(OUT);
 
 after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
@@ -79,4 +79,13 @@ describe("RateWindow", () => {
     assert.equal(rw.allow(60_000), false);
     assert.equal(rw.allow(60_001), true);
   });
+});
+
+test("Backoff: 실패마다 간격이 두 배로 늘고 상한에서 멈추며 성공하면 초기화", () => {
+  const b = new Backoff(1000, 4000);
+  assert.ok(b.ready(0));
+  b.fail(0); assert.ok(!b.ready(999)); assert.ok(b.ready(1000));
+  b.fail(1000); assert.ok(!b.ready(2999)); assert.ok(b.ready(3000));
+  b.fail(3000); assert.ok(!b.ready(6999)); assert.ok(b.ready(7000)); // 상한 4000
+  b.ok(); assert.ok(b.ready(7000));
 });
